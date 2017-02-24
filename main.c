@@ -11,6 +11,8 @@
  *  increments value of character, sends that back.
  *  2-21-17: Adapted from USB Device - CDC - Basic Demo - C18 - PICDEM FS USB
  *  2-23-17: Got UART working with XBEE at 57600 baud, but SPBRG must be initialized twice!
+ *  2-24-17: Read both joysticks. Right joystick readings 
+ *          converted to Roomba Drive Direct command.
  * 
  ********************************************************************/
 #include "USB/usb.h"
@@ -23,6 +25,15 @@
 #include "delay.h"
 #include <stdio.h>
 #include <stdlib.h>
+
+#define STX 36
+#define ETX 13
+#define DLE 16
+
+#define leftJoystickY   ADresult[0]
+#define leftJoystickX   ADresult[1]
+#define rightJoystickY  ADresult[2]
+#define rightJoystickX  ADresult[3]
 
 // These configs are for 18F4550 / 18F2550
 #pragma config PLLDIV   = 4
@@ -78,7 +89,7 @@ volatile BYTE buttonCount;
 
 /** P R I V A T E  P R O T O T Y P E S ***************************************/
 static void InitializeSystem(void);
-void ProcessIO(void);
+void ProcessIO(unsigned char flag);
 void USBDeviceTasks(void);
 void YourHighPriorityISRCode();
 void YourLowPriorityISRCode();
@@ -90,6 +101,12 @@ void ADsetChannel(unsigned char channel);
 short ADconvertAndRead(void);
 short ADread(void);
 void putch(unsigned char TxByte);
+void readJoySticks(void);
+unsigned char insertByte(unsigned char dataByte, unsigned char *ptrBuffer, unsigned char *index);
+unsigned char BuildPacket(unsigned char command, unsigned char *ptrData, unsigned char dataLength, unsigned char *ptrPacket);
+#define MAXPACKET 32
+unsigned char packet[MAXPACKET];
+
 
 /** VECTOR REMAPPING ***********************************************/
 #define REMAPPED_RESET_VECTOR_ADDRESS			0x1000
@@ -101,63 +118,143 @@ void putch(unsigned char TxByte);
 #define APP_FIRMWARE_VERSION_MAJOR  1   //valid values 0-255
 #define APP_FIRMWARE_VERSION_MINOR  0   //valid values 0-99
 
-// #pragma romdata AppVersionAndSignatureSection = APP_VERSION_ADDRESS $$$$
 ROM unsigned char AppVersion[2] = {APP_FIRMWARE_VERSION_MINOR, APP_FIRMWARE_VERSION_MAJOR};
-// #pragma romdata AppSignatureSection = APP_SIGNATURE_ADDRESS $$$$
 ROM unsigned short int SignaturePlaceholder = 0xFFFF;
-
 
 #pragma code
 
 #define NUM_AD_CHANNELS 4
 unsigned short ADresult[NUM_AD_CHANNELS] = {0, 0, 0, 0};
-unsigned char ADchannel = 0;
 
-union {
+union convertType {
     unsigned char byte[2];
-    unsigned int val;
-} integer;
+    int integer;
+} convert;
+
+#define LSBbyte byte[0]
+#define MSBbyte byte[1]
 
 #define SLEEP_ENABLE PORTAbits.RA5
 #define LED1 LATBbits.LATB2
 #define LED2 LATBbits.LATB1
 #define LED3 LATBbits.LATB0
 
-#define PUSH1 PORTBbits.RB7
-#define PUSH2 PORTBbits.RB6
-#define PUSH3 PORTBbits.RB5
+#define REDPUSHED 0x60
+#define BLUEPUSHED 0xA0
+#define YELLOWPUSHED 0xC0
+#define RELEASED 0xE0
+
+unsigned short ConvertToTwosComplement(int decimalValue) {
+    unsigned short result;
+
+    if (decimalValue >= 0)
+        result = (unsigned int) decimalValue;
+    else {
+        result = (unsigned int) (0 - decimalValue);
+        result = result - 1;
+        result = ~result;
+    }
+    return (result);
+}
+
+void startAD(void) {
+    ADsetChannel(0);
+    ADCON0bits.GO_DONE = 1;
+}
+
+#define DEBOUNCE_COUNTS 2
+
+unsigned char debounce(void) {
+    unsigned char previousPORTBreg = 0;
+    unsigned char PORTBreg = 0;
+    short debounceCounter = 0;
+
+    if (INTCONbits.RBIF) {
+        do {
+            PORTBreg = PORTB & 0b11100000;
+            INTCONbits.RBIF = 0;
+            if (PORTBreg == previousPORTBreg)
+                debounceCounter++;
+            else debounceCounter--;
+            previousPORTBreg = PORTBreg;
+            DelayMs(40);
+        } while (debounceCounter++ < DEBOUNCE_COUNTS);
+        return (PORTBreg);
+    } else return (0);
+}
+
+void putch(unsigned char TxByte) {
+    while (!PIR1bits.TXIF); // set when register is empty 
+    TXREG = TxByte;
+    return;
+}
+
+#define RUN 2
+#define HALT 1
+#define STANDBY 0 
+
+const unsigned char arrStart[] = {STX, 0, 1, 128, ETX};
+const unsigned char arrFull[] = {STX, 0, 1, 132, ETX};
+const unsigned char arrHalt[] = {STX, 0, 5, 145, 0, 0, 0, 0, ETX};
 
 void main(void) {
-    short TMR2counter = 0;
-    short counter = 0;
-    long putz = 0;
-
+    unsigned int TMR2counter = 0;
+    unsigned char TimerFlag = FALSE;
+    unsigned char pushState = 0, previousPushState = 0;
+    unsigned char LEDcounter = 0;
+    unsigned char mode = STANDBY;
+    unsigned char i = 0;
     DelayMs(100);
-    
+
     InitializeSystem();
     init();
-
-
-    ADchannel = 0;
-    ADsetChannel(ADchannel);
-    ADCON0bits.GO_DONE = 1;
+    LED1 = LED2 = LED3 = 0;
     SLEEP_ENABLE = 0;
-
-
-    printf("\rTesting UART at 57600 baud");
+    startAD();
 
     while (1) {
+        TimerFlag = FALSE;
+        if (PIR1bits.TMR2IF) {
+            PIR1bits.TMR2IF = 0;
+            TMR2counter++;
+            if (TMR2counter >= 100) {
+                TMR2counter = 0;
+                TimerFlag = TRUE;
+            }
+        }
 
-        /*
-        if (!PUSH1) LED1 = 1;
-        else LED1 = 0;
-        
-        if (!PUSH2) LED2 = 1;
-        else LED2 = 0;
-        
-        if (!PUSH3) LED3 = 1;
-        else LED3 = 0;
-         */
+#define LEDONTIME 100
+        pushState = debounce();
+        if (pushState != previousPushState) {
+            previousPushState = pushState;
+            if (pushState == REDPUSHED) {
+                LED1 = 1;
+                LEDcounter = LEDONTIME;
+                if (mode) {
+                    mode = HALT;
+                    for (i = 0; i < 9; i++) putch(arrHalt[i]);
+                }
+            } else if (pushState == BLUEPUSHED) {
+                LED2 = 1;
+                LEDcounter = LEDONTIME;
+                if (mode == STANDBY)
+                    for (i = 0; i < 5; i++) putch(arrStart[i]);
+                else
+                    for (i = 0; i < 5; i++) putch(arrFull[i]);
+                mode = HALT;
+            } else if (pushState == YELLOWPUSHED) {
+                LED3 = 1;
+                LEDcounter = LEDONTIME;
+                if (mode == HALT) mode = RUN;
+            } else if (pushState == RELEASED) {
+                ;
+            }
+        }
+        if (LEDcounter) {
+            LEDcounter--;
+            if (!LEDcounter) LED1 = LED2 = LED3 = 0;
+        }
+
 
 #if defined(USB_INTERRUPT)
         if (USB_BUS_SENSE && (USBGetDeviceState() == DETACHED_STATE)) {
@@ -169,10 +266,8 @@ void main(void) {
         // Check bus status and service USB interrupts.
         USBDeviceTasks();
 #endif
-        ProcessIO();
-
-
-
+        if (mode == RUN && TimerFlag) ProcessIO(TRUE);
+        else ProcessIO(FALSE);
     }//end while
 }//end main
 
@@ -229,24 +324,24 @@ void init(void) {
     TRISC = 0b11111111; // Set UART Tx pin to input       
 
     // Set up the UART         
-    BAUDCONbits.BRG16 = 0;  // 8 bit baud rate generator
-    TXSTAbits.BRGH = 1;     // divide by 16
+    BAUDCONbits.BRG16 = 0; // 8 bit baud rate generator
+    TXSTAbits.BRGH = 1; // divide by 16
 
-    TXSTAbits.SYNC = 0;     // asynchronous
-    RCSTAbits.SPEN = 1;     // enable serial port pins
-    RCSTAbits.CREN = 1;     // enable reception
-    RCSTAbits.SREN = 0;     // no effect
-    PIE1bits.TXIE = 0;      // disable tx interrupts 
-    PIE1bits.RCIE = 0;      // disable rx interrupts 
-    TXSTAbits.TX9 = 0;      // 8-bit transmission
-    RCSTAbits.RX9 = 0;      // 8-bit reception
-    TXSTAbits.TXEN = 0;     // Enable transmitter
-    BAUDCONbits.TXCKP = 0;  // Do not invert transmit and receive data
+    TXSTAbits.SYNC = 0; // asynchronous
+    RCSTAbits.SPEN = 1; // enable serial port pins
+    RCSTAbits.CREN = 1; // enable reception
+    RCSTAbits.SREN = 0; // no effect
+    PIE1bits.TXIE = 0; // disable tx interrupts 
+    PIE1bits.RCIE = 0; // disable rx interrupts 
+    TXSTAbits.TX9 = 0; // 8-bit transmission
+    RCSTAbits.RX9 = 0; // 8-bit reception
+    TXSTAbits.TXEN = 0; // Enable transmitter
+    BAUDCONbits.TXCKP = 0; // Do not invert transmit and receive data
     BAUDCONbits.RXDTP = 0;
-    SPBRG = 51;             // Baudrate = 57600 @ 48 Mhz clock 51
-    printf("X");            // NOTE: THIS AND THE NEXT LINE MUST BE HERE
-    SPBRG = 51;             // REPEAT INITIALIZATION
-    
+    SPBRG = 51; // Baudrate = 57600 @ 48 Mhz clock 51
+    printf(" "); // NOTE: THIS AND THE NEXT LINE MUST BE HERE
+    SPBRG = 51; // REPEAT INITIALIZATION
+
 
     // Set up Timer 2 to roll over every millisecond (1000 Hz))
     // 48000000 system clock / 4 / 16 prescaler / PR2 = 150 / 5 postscaler = 1000 Hz
@@ -274,94 +369,6 @@ void init(void) {
     INTCON2bits.INTEDG0 = 0; // Interrupt on falling edge of RB0 pushbutton wakes up PIC from sleep mode.
     INTCONbits.GIE = 0; // Disable all interrupts               
 }
-
-void ProcessIO(void) {
-#define USBBUFFERSIZE 64    
-    char USBdataBuffer[USBBUFFERSIZE];
-    int dataLength = 0;
-    static unsigned int TMR2counter = 0;
-    const unsigned short ADoffset[] = {450, 400, 430, 400};
-    const unsigned short ADspan[] = {150, 200, 200, 200};
-    unsigned char numBytesRead;
-    static unsigned int counter = 0;
-    unsigned char TimerFlag = FALSE;
-
-    if (PIR1bits.TMR2IF) {
-        PIR1bits.TMR2IF = 0;
-        TMR2counter++;
-        if (TMR2counter >= 100) {
-            TMR2counter = 0;
-            if (LED1) LED1 = 0;
-            else LED1 = 1;
-            printf("\rCounter: %d", counter++);
-            TimerFlag = TRUE;
-        }
-    }
-
-
-    if (!ADCON0bits.GO_DONE) {
-        if (ADchannel == 0 || ADchannel == 2)
-            ADresult[ADchannel] = ((1023 - ADread() - ADoffset[ADchannel]) * 255) / ADspan[ADchannel];
-        else ADresult[ADchannel] = ((ADread() - ADoffset[ADchannel]) * 255) / ADspan[ADchannel];
-        if (ADresult[ADchannel] > 300) ADresult[ADchannel] = 0;
-        else if (ADresult[ADchannel] > 255) ADresult[ADchannel] = 255;
-        ADchannel++;
-        if (ADchannel >= NUM_AD_CHANNELS) ADchannel = 0;
-        ADsetChannel(ADchannel);
-        ADCON0bits.GO_DONE = 1;
-    }
-
-    // Blink the LEDs according to the USB device status
-    // BlinkUSBStatus();
-    // User Application USB tasks
-    if ((USBDeviceState < CONFIGURED_STATE) || (USBSuspendControl == 1)) return;
-
-    if (TimerFlag) {
-        dataLength = sprintf(USBdataBuffer, "\r>%d, %d, %d, %d", ADresult[0], ADresult[1], ADresult[2], ADresult[3]);
-        if (dataLength > USBBUFFERSIZE) dataLength = USBBUFFERSIZE;
-        putUSBUSART(USBdataBuffer, dataLength);
-        // printf("\r>%d, %d, %d, %d", ADresult[0], ADresult[1], ADresult[2], ADresult[3]);
-    }
-    
-    if (buttonPressed) {
-        if (stringPrinted == FALSE) {
-            if (mUSBUSARTIsTxTrfReady()) {
-                putrsUSBUSART("Button Pressed -- \r\n");
-                stringPrinted = TRUE;
-            }
-        }
-    } else {
-        stringPrinted = FALSE;
-    }
-
-    if (USBUSARTIsTxTrfReady()) {
-        numBytesRead = getsUSBUSART(USB_Out_Buffer, 64);
-        if (numBytesRead != 0) {
-            BYTE i;
-
-            for (i = 0; i < numBytesRead; i++) {
-                switch (USB_Out_Buffer[i]) {
-                    case 0x0A:
-                    case 0x0D:
-                        USB_In_Buffer[i] = USB_Out_Buffer[i];
-                        break;
-                    default:
-                        USB_In_Buffer[i] = USB_Out_Buffer[i] + 1;
-                        break;
-                }
-
-            }
-            TMR2counter = 0;
-            dataLength = sprintf(USBdataBuffer, "\r<%d, %d, %d, %d", ADresult[0], ADresult[1], ADresult[2], ADresult[3]);
-            if (dataLength > USBBUFFERSIZE) dataLength = USBBUFFERSIZE;
-            putUSBUSART(USBdataBuffer, dataLength);
-        }
-    }
-
-
-
-    CDCTxService();
-} //end ProcessIO
 
 void BlinkUSBStatus(void) {
     static WORD led_count = 0;
@@ -523,6 +530,93 @@ BOOL USER_USB_CALLBACK_EVENT_HANDLER(int event, void *pdata, WORD size) {
     return TRUE;
 }
 
+void ProcessIO(unsigned char sendFlag) {
+#define USBBUFFERSIZE 64    
+    char USBdataBuffer[USBBUFFERSIZE];
+    int stringLength = 0;
+    unsigned char numBytesRead;
+    short intLeftJoystickY, intLeftJoystickX, intRightJoystickY, intRightJoystickX;
+    short rightMotor, leftMotor;
+    unsigned char rightMotorLSB, rightMotorMSB, leftMotorMSB, leftMotorLSB;
+    unsigned char motorData[5];
+    unsigned char packetLength, i;
+    unsigned char testChar = 'A';
+
+    readJoySticks();
+
+    if (sendFlag) {
+        intLeftJoystickY = ((short) leftJoystickY) - 127;
+        intLeftJoystickX = ((short) leftJoystickX) - 127;
+        intRightJoystickY = ((short) rightJoystickY) - 127;
+        intRightJoystickX = ((short) rightJoystickX) - 127;
+
+        //rightMotor = (intRightJoystickY * 2) - (intRightJoystickX / 2);
+        //leftMotor = (intRightJoystickY * 2) + (intRightJoystickX / 2);
+
+        rightMotor = (((intRightJoystickY * 2) - (intRightJoystickX / 2)) * 3) / 2;
+        if (rightMotor > 500) rightMotor = 500;
+        if (rightMotor < -500) rightMotor = -500;
+
+        leftMotor = (((intRightJoystickY * 2) + (intRightJoystickX / 2)) * 3) / 2;
+        if (leftMotor > 500) leftMotor = 500;
+        if (leftMotor < -500) leftMotor = -500;
+
+        convert.integer = leftMotor;
+        leftMotorLSB = convert.byte[0];
+        leftMotorMSB = convert.byte[1];
+
+        convert.integer = rightMotor;
+        rightMotorLSB = convert.byte[0];
+        rightMotorMSB = convert.byte[1];
+
+        motorData[0] = 145;
+        motorData[1] = rightMotorMSB;
+        motorData[2] = rightMotorLSB;
+        motorData[3] = leftMotorMSB;
+        motorData[4] = leftMotorLSB;
+
+        packetLength = BuildPacket(0, motorData, 5, packet);
+
+        packetLength = 9;
+        if (packetLength < MAXPACKET) for (i = 0; i < packetLength; i++) putch(packet[i]);
+    }
+
+    // Blink the LEDs according to the USB device status
+    // BlinkUSBStatus();
+    // User Application USB tasks
+    if ((USBDeviceState < CONFIGURED_STATE) || (USBSuspendControl == 1)) return;
+    
+    
+    stringLength = sprintf(USBdataBuffer, "\r>LEFT: %d, RIGHT: %d", leftMotor, rightMotor);
+    if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
+    putUSBUSART(USBdataBuffer, stringLength);
+
+
+    if (USBUSARTIsTxTrfReady()) {
+        numBytesRead = getsUSBUSART(USB_Out_Buffer, 64);
+        if (numBytesRead != 0) {
+            BYTE i;
+
+            for (i = 0; i < numBytesRead; i++) {
+                switch (USB_Out_Buffer[i]) {
+                    case 0x0A:
+                    case 0x0D:
+                        USB_In_Buffer[i] = USB_Out_Buffer[i];
+                        break;
+                    default:
+                        USB_In_Buffer[i] = USB_Out_Buffer[i] + 1;
+                        break;
+                }
+            }
+            stringLength = sprintf(USBdataBuffer, "\r<%d, %d, %d, %d", ADresult[0], ADresult[1], ADresult[2], ADresult[3]);
+            if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
+            putUSBUSART(USBdataBuffer, stringLength);
+        }
+    }
+
+    CDCTxService();
+} //end ProcessIO
+
 void ADsetChannel(unsigned char channel) {
     ADCON0 = (channel << 2) | 0x01; // enable ADC, RC osc.    
 }
@@ -547,10 +641,58 @@ short ADread(void) {
     return (ADresult);
 }
 
-/*
-void putch(unsigned char TxByte) {
-    while (!PIR1bits.TXIF); // set when register is empty 
-    TXREG = TxByte;
-    return;
+void readJoySticks(void) {
+    static unsigned char ADchannel = 0;
+    const unsigned short ADoffset[] = {450, 400, 430, 400};
+    const unsigned short ADspan[] = {150, 200, 200, 200};
+    unsigned short joyStickReading, offset, span;
+
+    if (!ADCON0bits.GO_DONE) {
+        if (ADchannel == 0 || ADchannel == 2) joyStickReading = 1023 - ADread();
+        else joyStickReading = ADread();
+
+        offset = ADoffset[ADchannel];
+        span = ADspan[ADchannel];
+        if (joyStickReading < offset) joyStickReading = 0;
+        else joyStickReading = joyStickReading - offset;
+        if (joyStickReading > span) joyStickReading = span;
+
+        ADresult[ADchannel] = (joyStickReading * 255) / span;
+        if (ADresult[ADchannel] > 255) ADresult[ADchannel] = 255;
+
+        ADchannel++;
+        if (ADchannel >= NUM_AD_CHANNELS) ADchannel = 0;
+        ADsetChannel(ADchannel);
+        ADCON0bits.GO_DONE = 1;
+    }
 }
- */
+
+unsigned char insertByte(unsigned char dataByte, unsigned char *ptrBuffer, unsigned char *index) {
+    if (*index >= MAXPACKET) return (FALSE);
+    if (dataByte == STX || dataByte == DLE || dataByte == ETX) {
+        ptrBuffer[*index] = DLE;
+        *index = *index + 1;
+    }
+    if (*index >= MAXPACKET) return (FALSE);
+    ptrBuffer[*index] = dataByte;
+    *index = *index + 1;
+    return (TRUE);
+}
+
+unsigned char BuildPacket(unsigned char command, unsigned char *ptrData, unsigned char dataLength, unsigned char *ptrPacket) {
+    unsigned char packetIndex = 0, i;
+
+    if (dataLength <= MAXPACKET) {
+        ptrPacket[packetIndex++] = STX;
+        ptrPacket[packetIndex++] = command;
+        ptrPacket[packetIndex++] = dataLength;
+
+        for (i = 0; i < dataLength; i++){
+            if (!insertByte(ptrData[i], ptrPacket, &packetIndex))
+                return(0);
+        }
+        ptrPacket[packetIndex++] = ETX;
+
+        return (packetIndex);
+    } else return (0);
+}
