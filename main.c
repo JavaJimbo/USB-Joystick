@@ -13,7 +13,8 @@
  *  2-23-17: Got UART working with XBEE at 57600 baud, but SPBRG must be initialized twice!
  *  2-24-17: Read both joysticks. Right joystick readings 
  *          converted to Roomba Drive Direct command.
- * 
+ * 3-2-2017: Command sequence is now: COMMAND, SUBCOMMAND, NUM DATA BYTES, DATA....
+ * 5-9-2017: Modified code to work with Quad Motor board.
  ********************************************************************/
 #include "USB/usb.h"
 #include "USB/usb_function_cdc.h"
@@ -29,6 +30,8 @@
 #define STX 36
 #define ETX 13
 #define DLE 16
+
+
 
 #define leftJoystickY   ADresult[0]
 #define leftJoystickX   ADresult[1]
@@ -103,7 +106,7 @@ short ADread(void);
 void putch(unsigned char TxByte);
 void readJoySticks(void);
 unsigned char insertByte(unsigned char dataByte, unsigned char *ptrBuffer, unsigned char *index);
-unsigned char BuildPacket(unsigned char command, unsigned char *ptrData, unsigned char dataLength, unsigned char *ptrPacket);
+unsigned char BuildPacket(unsigned char command, unsigned char subCommand, unsigned char dataLength, unsigned char *ptrData, unsigned char *ptrPacket);
 #define MAXPACKET 32
 unsigned char packet[MAXPACKET];
 
@@ -183,26 +186,27 @@ unsigned char debounce(void) {
     } else return (0);
 }
 
-void putch(unsigned char TxByte) {
-    while (!PIR1bits.TXIF); // set when register is empty 
-    TXREG = TxByte;
-    return;
-}
+
 
 #define RUN 2
 #define HALT 1
 #define STANDBY 0 
 
-const unsigned char arrStart[] = {STX, 0, 1, 128, ETX};
-const unsigned char arrFull[] = {STX, 0, 1, 132, ETX};
-const unsigned char arrHalt[] = {STX, 0, 5, 145, 0, 0, 0, 0, ETX};
+#define ROOMBA 0
+#define FULL 132
+#define START 128
+#define DRIVEDIRECT 145
+
+const unsigned char arrStart[] = {STX, ROOMBA, START, 0, ETX};
+const unsigned char arrFull[] = {STX, ROOMBA, FULL, 0, ETX};
+const unsigned char arrHalt[] = {STX, ROOMBA, DRIVEDIRECT, 4, 0, 0, 0, 0, ETX};
 
 void main(void) {
     unsigned int TMR2counter = 0;
     unsigned char TimerFlag = FALSE;
     unsigned char pushState = 0, previousPushState = 0;
     unsigned char LEDcounter = 0;
-    unsigned char mode = STANDBY;
+    unsigned char mode = RUN; // STANDBY;
     unsigned char i = 0;
     DelayMs(100);
 
@@ -223,6 +227,7 @@ void main(void) {
             }
         }
 
+        /*
 #define LEDONTIME 100
         pushState = debounce();
         if (pushState != previousPushState) {
@@ -254,7 +259,7 @@ void main(void) {
             LEDcounter--;
             if (!LEDcounter) LED1 = LED2 = LED3 = 0;
         }
-
+        */
 
 #if defined(USB_INTERRUPT)
         if (USB_BUS_SENSE && (USBGetDeviceState() == DETACHED_STATE)) {
@@ -545,21 +550,43 @@ void ProcessIO(unsigned char sendFlag) {
     readJoySticks();
 
     if (sendFlag) {
+        
+        //stringLength = sprintf(USBdataBuffer, "\r>LEFT: %d, RIGHT: %d", leftMotor, rightMotor);
+        //if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
+        
+        
         intLeftJoystickY = ((short) leftJoystickY) - 127;
+        //intLeftJoystickY = intLeftJoystickY * 4;
+        
         intLeftJoystickX = ((short) leftJoystickX) - 127;
+        //intLeftJoystickX = intLeftJoystickX * 4;
+        
         intRightJoystickY = ((short) rightJoystickY) - 127;
+        //intRightJoystickY = intRightJoystickY * 4;
+        
         intRightJoystickX = ((short) rightJoystickX) - 127;
+        //intRightJoystickX = intRightJoystickX * 4;
+        
+        
 
-        //rightMotor = (intRightJoystickY * 2) - (intRightJoystickX / 2);
-        //leftMotor = (intRightJoystickY * 2) + (intRightJoystickX / 2);
+        // rightMotor = (((intRightJoystickY * 2) - (intRightJoystickX / 2)) * 3) / 2;
+        // rightMotor = ((intRightJoystickY * 2) - (intRightJoystickX / 2)) * 3;
+        rightMotor = intRightJoystickY - intRightJoystickX;
+        rightMotor = rightMotor * 8;
+        if (rightMotor > 1000) rightMotor = 1000;  // Was 500 for Roomba
+        if (rightMotor < -1000) rightMotor = -1000;
 
-        rightMotor = (((intRightJoystickY * 2) - (intRightJoystickX / 2)) * 3) / 2;
-        if (rightMotor > 500) rightMotor = 500;
-        if (rightMotor < -500) rightMotor = -500;
-
-        leftMotor = (((intRightJoystickY * 2) + (intRightJoystickX / 2)) * 3) / 2;
-        if (leftMotor > 500) leftMotor = 500;
-        if (leftMotor < -500) leftMotor = -500;
+        // leftMotor = (((intRightJoystickY * 2) + (intRightJoystickX / 2)) * 3) / 2;
+        // leftMotor = ((intRightJoystickY * 2) + (intRightJoystickX / 2)) * 3;
+        leftMotor = intRightJoystickY + intRightJoystickX;
+        leftMotor = leftMotor * 8;
+        if (leftMotor > 1000) leftMotor = 1000;
+        if (leftMotor < -1000) leftMotor = -1000;
+        
+            stringLength = sprintf(USBdataBuffer, "\r<Y: %d, X: %d, RIGHT: %d, LEFT: %d", intRightJoystickY, intRightJoystickX, rightMotor, leftMotor);
+            if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
+            putUSBUSART(USBdataBuffer, stringLength);
+        
 
         convert.integer = leftMotor;
         leftMotorLSB = convert.byte[0];
@@ -568,16 +595,14 @@ void ProcessIO(unsigned char sendFlag) {
         convert.integer = rightMotor;
         rightMotorLSB = convert.byte[0];
         rightMotorMSB = convert.byte[1];
+        
+        motorData[0] = rightMotorMSB;
+        motorData[1] = rightMotorLSB;
+        motorData[2] = leftMotorMSB;
+        motorData[3] = leftMotorLSB;
 
-        motorData[0] = 145;
-        motorData[1] = rightMotorMSB;
-        motorData[2] = rightMotorLSB;
-        motorData[3] = leftMotorMSB;
-        motorData[4] = leftMotorLSB;
+        packetLength = BuildPacket(ROOMBA, DRIVEDIRECT, 4, motorData, packet);
 
-        packetLength = BuildPacket(0, motorData, 5, packet);
-
-        packetLength = 9;
         if (packetLength < MAXPACKET) for (i = 0; i < packetLength; i++) putch(packet[i]);
     }
 
@@ -587,9 +612,9 @@ void ProcessIO(unsigned char sendFlag) {
     if ((USBDeviceState < CONFIGURED_STATE) || (USBSuspendControl == 1)) return;
     
     
-    stringLength = sprintf(USBdataBuffer, "\r>LEFT: %d, RIGHT: %d", leftMotor, rightMotor);
-    if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
-    putUSBUSART(USBdataBuffer, stringLength);
+    //stringLength = sprintf(USBdataBuffer, "\r>LEFT: %d, RIGHT: %d", leftMotor, rightMotor);
+    //if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
+    // putUSBUSART(USBdataBuffer, stringLength);
 
 
     if (USBUSARTIsTxTrfReady()) {
@@ -608,8 +633,6 @@ void ProcessIO(unsigned char sendFlag) {
                         break;
                 }
             }
-            stringLength = sprintf(USBdataBuffer, "\r<%d, %d, %d, %d", ADresult[0], ADresult[1], ADresult[2], ADresult[3]);
-            if (stringLength > USBBUFFERSIZE) stringLength = USBBUFFERSIZE;
             putUSBUSART(USBdataBuffer, stringLength);
         }
     }
@@ -648,6 +671,7 @@ void readJoySticks(void) {
     unsigned short joyStickReading, offset, span;
 
     if (!ADCON0bits.GO_DONE) {
+        
         if (ADchannel == 0 || ADchannel == 2) joyStickReading = 1023 - ADread();
         else joyStickReading = ADread();
 
@@ -659,7 +683,7 @@ void readJoySticks(void) {
 
         ADresult[ADchannel] = (joyStickReading * 255) / span;
         if (ADresult[ADchannel] > 255) ADresult[ADchannel] = 255;
-
+        
         ADchannel++;
         if (ADchannel >= NUM_AD_CHANNELS) ADchannel = 0;
         ADsetChannel(ADchannel);
@@ -679,20 +703,27 @@ unsigned char insertByte(unsigned char dataByte, unsigned char *ptrBuffer, unsig
     return (TRUE);
 }
 
-unsigned char BuildPacket(unsigned char command, unsigned char *ptrData, unsigned char dataLength, unsigned char *ptrPacket) {
+unsigned char BuildPacket(unsigned char command, unsigned char subCommand, unsigned char dataLength, unsigned char *ptrData, unsigned char *ptrPacket) {
     unsigned char packetIndex = 0, i;
 
     if (dataLength <= MAXPACKET) {
         ptrPacket[packetIndex++] = STX;
-        ptrPacket[packetIndex++] = command;
-        ptrPacket[packetIndex++] = dataLength;
+        // ptrPacket[packetIndex++] = command;
+        if (!insertByte(command, ptrPacket, &packetIndex)) return(0);
+        if (!insertByte(subCommand, ptrPacket, &packetIndex)) return(0);
+        if (!insertByte(dataLength, ptrPacket, &packetIndex)) return(0);
 
         for (i = 0; i < dataLength; i++){
-            if (!insertByte(ptrData[i], ptrPacket, &packetIndex))
-                return(0);
+            if (!insertByte(ptrData[i], ptrPacket, &packetIndex)) return(0);
         }
         ptrPacket[packetIndex++] = ETX;
 
         return (packetIndex);
     } else return (0);
 }
+
+void putch(unsigned char TxByte){
+    while(!PIR1bits.TXIF);
+    TXREG = TxByte;
+}
+    
